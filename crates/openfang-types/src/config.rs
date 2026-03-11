@@ -1524,7 +1524,12 @@ pub struct ChannelsConfig {
     /// Telegram bot configuration (None = disabled).
     pub telegram: Option<TelegramConfig>,
     /// Discord bot configuration (None = disabled).
+    /// Prefer `discord_bots` for multi‑bot setups.
     pub discord: Option<DiscordConfig>,
+    /// Multiple Discord bot configurations for multi‑agent setups.
+    /// If empty, falls back to `discord`.
+    #[serde(default)]
+    pub discord_bots: Vec<DiscordConfig>,
     /// Slack bot configuration (None = disabled).
     pub slack: Option<SlackConfig>,
     /// WhatsApp Cloud API configuration (None = disabled).
