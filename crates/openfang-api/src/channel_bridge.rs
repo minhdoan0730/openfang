@@ -24,6 +24,9 @@ use openfang_channels::zulip::ZulipAdapter;
 // Multi-agent Discord components (reaction system temporarily disabled)
 // use openfang_channels::classifier::DomainClassifier;
 // use openfang_channels::reaction::ReactionCoordinator;
+// Multi-agent Discord components
+use openfang_channels::classifier::DomainClassifier;
+use openfang_channels::reaction::ReactionCoordinator;
 use openfang_channels::registry::{AdapterRegistry, BoardroomRegistry};
 use openfang_channels::topic::TopicFilter;
 // Wave 3
@@ -57,7 +60,7 @@ use openfang_channels::ntfy::NtfyAdapter;
 use openfang_channels::webhook::WebhookAdapter;
 use openfang_kernel::OpenFangKernel;
 use openfang_types::agent::AgentId;
-use openfang_types::config::{BoardroomConfig, DiscordConfig, TopicFilterConfig};
+use openfang_types::config::{BoardroomConfig, ReactionConfig, TopicFilterConfig, TurnPolicy};
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 use tracing::{error, info, warn};
@@ -1183,71 +1186,51 @@ pub async fn start_channel_bridge_with_config(
         }
     }
 
-    // Discord - multi-bot support via discord_bots, fallback to discord for backward compatibility
-    let discord_configs = if !config.discord_bots.is_empty() {
-        &config.discord_bots
-    } else if let Some(ref dc) = config.discord {
-        // Single bot legacy configuration
-        std::slice::from_ref(dc)
-    } else {
-        &[]
-    };
+    // Discord
+    if let Some(ref dc_config) = config.discord {
+        if let Some(token) = read_token(&dc_config.bot_token_env, "Discord") {
+            // Create adapter first without Arc to allow mutating it
+            let mut adapter = DiscordAdapter::new(
+                token,
+                dc_config.allowed_guilds.clone(),
+                dc_config.allowed_users.clone(),
+                dc_config.ignore_bots,
+                dc_config.intents,
+                dc_config.default,
+                dc_config.passive_channels.clone(),
+                dc_config.peers.clone(),
+            );
 
-    if !discord_configs.is_empty() {
-        // Shared adapter registry for multi-bot RelayReply mode
-        let shared_adapter_registry = Arc::new(AdapterRegistry::new());
+            // Initialize multi-agent components with default configs
+            // 1. Adapter registry for multi-bot token mapping
+            let adapter_registry = Arc::new(AdapterRegistry::new());
+            adapter.set_adapter_registry(adapter_registry);
 
-        // Shared boardroom registry (thread state independent of bot token)
-        let shared_boardroom_registry = match BoardroomRegistry::new(BoardroomConfig::default(), kernel.memory.clone()).await {
-            Ok(registry) => Some(Arc::new(registry)),
-            Err(e) => {
-                warn!("Failed to create boardroom registry, boardroom features disabled: {}", e);
-                None
+            // 2. Reaction coordinator for Tier 2-3 ladder
+            let reaction_config = ReactionConfig::default();
+            let reaction_coordinator = Arc::new(ReactionCoordinator::new(reaction_config));
+            adapter.set_reaction_coordinator(reaction_coordinator);
+
+            // 3. Domain classifier for Tier 3 ambiguous cases
+            let classifier_config = ReactionConfig::default(); // Uses same config
+            let classifier = Arc::new(DomainClassifier::new(classifier_config));
+            adapter.set_classifier(classifier);
+
+            // 4. Topic filter for Tier 1 (empty config for now - would be per-agent)
+            let topic_filter_config = TopicFilterConfig::default();
+            let topic_filter = TopicFilter::new(topic_filter_config);
+            adapter.set_topic_filter(topic_filter);
+
+            // 5. Boardroom registry (requires memory substrate)
+            let boardroom_config = BoardroomConfig::default();
+            if let Ok(boardroom_registry) = BoardroomRegistry::new(boardroom_config, kernel.memory.clone()).await {
+                adapter.set_boardroom_registry(Arc::new(boardroom_registry));
+            } else {
+                warn!("Failed to create boardroom registry, boardroom features disabled");
             }
-        };
 
-        for dc_config in discord_configs {
-            if let Some(token) = read_discord_token(dc_config) {
-                // Create adapter first without Arc to allow mutating it
-                let mut adapter = DiscordAdapter::new(
-                    token,
-                    dc_config.allowed_guilds.clone(),
-                    dc_config.allowed_users.clone(),
-                    dc_config.ignore_bots,
-                    dc_config.intents,
-                    dc_config.default,
-                    dc_config.passive_channels.clone(),
-                    dc_config.peers.clone(),
-                );
-
-                // Set the shared adapter registry (needed before Arc wrap)
-                adapter.set_adapter_registry(shared_adapter_registry.clone());
-
-                // Topic filter for Tier 1 relevance filtering (kept, reaction system disabled temporarily)
-                let topic_filter_config = TopicFilterConfig::default();
-                let topic_filter = TopicFilter::new(topic_filter_config);
-                adapter.set_topic_filter(topic_filter);
-
-                // Set shared boardroom registry if available
-                if let Some(ref boardroom_registry) = shared_boardroom_registry {
-                    adapter.set_boardroom_registry(boardroom_registry.clone());
-                }
-
-                // Wrap in Arc, register in shared registry (if default agent specified), then add to adapters list
-                let adapter_arc = Arc::new(adapter);
-
-                // Register this adapter in the shared registry for RelayReply mode
-                // Maps (ChannelType::Discord, agent_id) → adapter instance
-                if let Some(default_agent) = &dc_config.default_agent {
-                    shared_adapter_registry.register(
-                        ChannelType::Discord,
-                        default_agent.clone(),
-                        adapter_arc.clone(),
-                    );
-                }
-
-                adapters.push((adapter_arc, dc_config.default_agent.clone()));
-            }
+            let adapter = Arc::new(adapter);
+            adapters.push((adapter, dc_config.default_agent.clone()));
         }
     }
 
