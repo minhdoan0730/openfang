@@ -4,9 +4,7 @@
 //! delegate to a specialist, or start a boardroom thread.
 
 use openfang_types::config::{RoutingRosterEntry, TurnPolicy, ReplyMode};
-use serde::{Deserialize, Serialize};
 use serde_json::Value;
-use std::collections::HashMap;
 use tracing::{debug, warn};
 
 /// Routing decision produced by the classifier.
