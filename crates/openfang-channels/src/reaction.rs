@@ -24,6 +24,7 @@ pub enum WinnerDecision {
 
 /// A single reaction event.
 #[derive(Debug, Clone)]
+#[allow(dead_code)]
 struct ReactionEvent {
     agent_id: String,
     emoji: String,
@@ -37,6 +38,7 @@ pub struct ReactionCoordinator {
     windows: RwLock<HashMap<String, Arc<RwLock<CoordinationWindow>>>>,
 }
 
+#[allow(dead_code)]
 struct CoordinationWindow {
     message_id: String,
     reactions: Vec<ReactionEvent>,

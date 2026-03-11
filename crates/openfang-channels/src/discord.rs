@@ -6,9 +6,9 @@
 use crate::types::{
     split_message, ChannelAdapter, ChannelContent, ChannelMessage, ChannelType, ChannelUser,
 };
-use crate::boardroom::BoardroomRegistry;
-use crate::topic_filter::TopicFilter;
-use crate::reaction_coordinator::ReactionCoordinator;
+use crate::registry::BoardroomRegistry;
+use crate::topic::TopicFilter;
+use crate::reaction::ReactionCoordinator;
 use crate::classifier::DomainClassifier;
 use crate::registry::AdapterRegistry;
 use async_trait::async_trait;
@@ -74,7 +74,9 @@ pub struct DiscordAdapter {
     adapter_registry: Option<Arc<AdapterRegistry>>,
 }
 
+#[allow(dead_code)]
 impl DiscordAdapter {
+    #[allow(clippy::too_many_arguments)]
     pub fn new(
         token: String,
         allowed_guilds: Vec<String>,
@@ -629,6 +631,7 @@ impl ChannelAdapter for DiscordAdapter {
 }
 
 /// Parse a Discord MESSAGE_CREATE or MESSAGE_UPDATE payload into a `ChannelMessage`.
+#[allow(clippy::too_many_arguments)]
 async fn parse_discord_message(
     d: &serde_json::Value,
     bot_user_id: &Arc<RwLock<Option<String>>>,
@@ -928,7 +931,7 @@ mod tests {
             "timestamp": "2024-01-01T00:00:00+00:00"
         });
 
-        let msg = parse_discord_message(&d, &bot_id, &[], &[], true).await.unwrap();
+        let msg = parse_discord_message(&d, &bot_id, &[], &[], true, true, &[], &std::collections::HashMap::new(), None).await.unwrap();
         match &msg.content {
             ChannelContent::Command { name, args } => {
                 assert_eq!(name, "agent");
@@ -953,7 +956,7 @@ mod tests {
             "timestamp": "2024-01-01T00:00:00+00:00"
         });
 
-        let msg = parse_discord_message(&d, &bot_id, &[], &[], true).await;
+        let msg = parse_discord_message(&d, &bot_id, &[], &[], true, true, &[], &std::collections::HashMap::new(), None).await;
         assert!(msg.is_none());
     }
 
@@ -972,7 +975,7 @@ mod tests {
             "timestamp": "2024-01-01T00:00:00+00:00"
         });
 
-        let msg = parse_discord_message(&d, &bot_id, &[], &[], true).await.unwrap();
+        let msg = parse_discord_message(&d, &bot_id, &[], &[], true, true, &[], &std::collections::HashMap::new(), None).await.unwrap();
         assert_eq!(msg.sender.display_name, "alice#1234");
     }
 
@@ -994,7 +997,7 @@ mod tests {
         });
 
         // MESSAGE_UPDATE uses the same parse function as MESSAGE_CREATE
-        let msg = parse_discord_message(&d, &bot_id, &[], &[], true).await.unwrap();
+        let msg = parse_discord_message(&d, &bot_id, &[], &[], true, true, &[], &std::collections::HashMap::new(), None).await.unwrap();
         assert_eq!(msg.channel, ChannelType::Discord);
         assert!(
             matches!(msg.content, ChannelContent::Text(ref t) if t == "Edited message content")
@@ -1017,15 +1020,15 @@ mod tests {
         });
 
         // Not in allowed users
-        let msg = parse_discord_message(&d, &bot_id, &[], &["user111".into(), "user222".into()], true).await;
+        let msg = parse_discord_message(&d, &bot_id, &[], &["user111".into(), "user222".into()], true, true, &[], &std::collections::HashMap::new(), None).await;
         assert!(msg.is_none());
 
         // In allowed users
-        let msg = parse_discord_message(&d, &bot_id, &[], &["user999".into()], true).await;
+        let msg = parse_discord_message(&d, &bot_id, &[], &["user999".into()], true, true, &[], &std::collections::HashMap::new(), None).await;
         assert!(msg.is_some());
 
         // Empty allowed_users = allow all
-        let msg = parse_discord_message(&d, &bot_id, &[], &[], true).await;
+        let msg = parse_discord_message(&d, &bot_id, &[], &[], true, true, &[], &std::collections::HashMap::new(), None).await;
         assert!(msg.is_some());
     }
 
@@ -1048,7 +1051,7 @@ mod tests {
             "timestamp": "2024-01-01T00:00:00+00:00"
         });
 
-        let msg = parse_discord_message(&d, &bot_id, &[], &[], true).await.unwrap();
+        let msg = parse_discord_message(&d, &bot_id, &[], &[], true, true, &[], &std::collections::HashMap::new(), None).await.unwrap();
         assert!(msg.is_group);
         assert_eq!(msg.metadata.get("was_mentioned").and_then(|v| v.as_bool()), Some(true));
 
@@ -1066,7 +1069,7 @@ mod tests {
             "timestamp": "2024-01-01T00:00:00+00:00"
         });
 
-        let msg2 = parse_discord_message(&d2, &bot_id, &[], &[], true).await.unwrap();
+        let msg2 = parse_discord_message(&d2, &bot_id, &[], &[], true, true, &[], &std::collections::HashMap::new(), None).await.unwrap();
         assert!(msg2.is_group);
         assert!(!msg2.metadata.contains_key("was_mentioned"));
     }
@@ -1086,7 +1089,7 @@ mod tests {
             "timestamp": "2024-01-01T00:00:00+00:00"
         });
 
-        let msg = parse_discord_message(&d, &bot_id, &[], &[], true).await.unwrap();
+        let msg = parse_discord_message(&d, &bot_id, &[], &[], true, true, &[], &std::collections::HashMap::new(), None).await.unwrap();
         assert!(!msg.is_group);
     }
 

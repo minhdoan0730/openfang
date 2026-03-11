@@ -82,7 +82,7 @@ impl DomainClassifier {
                 return ClassificationResponse {
                     winner: agent.clone(),
                     confidence: 0.85,
-                    reasoning: format!("Agent ID found in message text."),
+                    reasoning: "Agent ID found in message text.".to_string(),
                 };
             }
         }

@@ -21,6 +21,11 @@ use openfang_channels::types::ChannelAdapter;
 use openfang_channels::whatsapp::WhatsAppAdapter;
 use openfang_channels::xmpp::XmppAdapter;
 use openfang_channels::zulip::ZulipAdapter;
+// Multi-agent Discord components
+use openfang_channels::classifier::DomainClassifier;
+use openfang_channels::reaction::ReactionCoordinator;
+use openfang_channels::registry::{AdapterRegistry, BoardroomRegistry};
+use openfang_channels::topic::TopicFilter;
 // Wave 3
 use openfang_channels::bluesky::BlueskyAdapter;
 use openfang_channels::feishu::FeishuAdapter;
@@ -52,6 +57,7 @@ use openfang_channels::ntfy::NtfyAdapter;
 use openfang_channels::webhook::WebhookAdapter;
 use openfang_kernel::OpenFangKernel;
 use openfang_types::agent::AgentId;
+use openfang_types::config::{BoardroomConfig, ReactionConfig, TopicFilterConfig, TurnPolicy};
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 use tracing::{error, info, warn};
@@ -1091,7 +1097,8 @@ pub async fn start_channel_bridge_with_config(
     // Discord
     if let Some(ref dc_config) = config.discord {
         if let Some(token) = read_token(&dc_config.bot_token_env, "Discord") {
-            let adapter = Arc::new(DiscordAdapter::new(
+            // Create adapter first without Arc to allow mutating it
+            let mut adapter = DiscordAdapter::new(
                 token,
                 dc_config.allowed_guilds.clone(),
                 dc_config.allowed_users.clone(),
@@ -1100,7 +1107,37 @@ pub async fn start_channel_bridge_with_config(
                 dc_config.default,
                 dc_config.passive_channels.clone(),
                 dc_config.peers.clone(),
-            ));
+            );
+
+            // Initialize multi-agent components with default configs
+            // 1. Adapter registry for multi-bot token mapping
+            let adapter_registry = Arc::new(AdapterRegistry::new());
+            adapter.set_adapter_registry(adapter_registry);
+
+            // 2. Reaction coordinator for Tier 2-3 ladder
+            let reaction_config = ReactionConfig::default();
+            let reaction_coordinator = Arc::new(ReactionCoordinator::new(reaction_config));
+            adapter.set_reaction_coordinator(reaction_coordinator);
+
+            // 3. Domain classifier for Tier 3 ambiguous cases
+            let classifier_config = ReactionConfig::default(); // Uses same config
+            let classifier = Arc::new(DomainClassifier::new(classifier_config));
+            adapter.set_classifier(classifier);
+
+            // 4. Topic filter for Tier 1 (empty config for now - would be per-agent)
+            let topic_filter_config = TopicFilterConfig::default();
+            let topic_filter = TopicFilter::new(topic_filter_config);
+            adapter.set_topic_filter(topic_filter);
+
+            // 5. Boardroom registry (requires memory substrate)
+            let boardroom_config = BoardroomConfig::default();
+            if let Ok(boardroom_registry) = BoardroomRegistry::new(boardroom_config, kernel.memory.clone()).await {
+                adapter.set_boardroom_registry(Arc::new(boardroom_registry));
+            } else {
+                warn!("Failed to create boardroom registry, boardroom features disabled");
+            }
+
+            let adapter = Arc::new(adapter);
             adapters.push((adapter, dc_config.default_agent.clone()));
         }
     }
