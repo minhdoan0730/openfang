@@ -484,6 +484,24 @@ pub struct AgentManifest {
     /// Tool blocklist — these tools are excluded (applied after allowlist).
     #[serde(default, deserialize_with = "crate::serde_compat::vec_lenient")]
     pub tool_blocklist: Vec<String>,
+    /// How this agent replies when delegated a task.
+    #[serde(default)]
+    pub reply_mode: crate::config::ReplyMode,
+    /// Agent IDs that this agent can invite to boardroom threads.
+    #[serde(default, deserialize_with = "crate::serde_compat::vec_lenient")]
+    pub boardroom_can_invite: Vec<String>,
+    /// Turn policy to use when this agent creates a boardroom thread.
+    #[serde(default)]
+    pub boardroom_turn_policy: crate::config::TurnPolicy,
+    /// Emoji representing this agent’s domain in boardroom threads.
+    #[serde(default)]
+    pub boardroom_domain_emoji: String,
+    /// Topic filter for Tier 1 relevance classification.
+    #[serde(default)]
+    pub topic_filter: crate::config::TopicFilterConfig,
+    /// Routing roster of specialist agents this agent can delegate to.
+    #[serde(default, deserialize_with = "crate::serde_compat::vec_lenient")]
+    pub routing_roster: Vec<crate::config::RoutingRosterEntry>,
 }
 
 fn default_true() -> bool {
@@ -518,6 +536,12 @@ impl Default for AgentManifest {
             exec_policy: None,
             tool_allowlist: Vec::new(),
             tool_blocklist: Vec::new(),
+            reply_mode: crate::config::ReplyMode::default(),
+            boardroom_can_invite: Vec::new(),
+            boardroom_turn_policy: crate::config::TurnPolicy::default(),
+            boardroom_domain_emoji: String::new(),
+            topic_filter: crate::config::TopicFilterConfig::default(),
+            routing_roster: Vec::new(),
         }
     }
 }
@@ -775,6 +799,12 @@ mod tests {
             exec_policy: None,
             tool_allowlist: Vec::new(),
             tool_blocklist: Vec::new(),
+            reply_mode: crate::config::ReplyMode::default(),
+            boardroom_can_invite: Vec::new(),
+            boardroom_turn_policy: crate::config::TurnPolicy::default(),
+            boardroom_domain_emoji: String::new(),
+            topic_filter: crate::config::TopicFilterConfig::default(),
+            routing_roster: Vec::new(),
         };
         let json = serde_json::to_string(&manifest).unwrap();
         let deserialized: AgentManifest = serde_json::from_str(&json).unwrap();

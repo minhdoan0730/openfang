@@ -33,13 +33,55 @@ listen_addr = "127.0.0.1:4200"           # OFP listen address
 # bot_token_env = "TELEGRAM_BOT_TOKEN"
 # allowed_users = []                      # Empty = allow all
 
+# Discord adapter (single bot)
 # [discord]
 # bot_token_env = "DISCORD_BOT_TOKEN"
-# guild_ids = []                          # Empty = all guilds
+# allowed_guilds = []                     # Empty = allow all guilds (servers)
+# allowed_users = []                      # Empty = allow all users
+# default_agent = "general"               # Default agent for unaddressed messages
+# ignore_bots = true                      # Ignore messages from other bots
+# default = true                          # This bot is the default for the channel
+# passive_channels = []                   # Channel IDs where bot only responds to @mentions
+# peers = { "agent1" = "1234567890" }    # Map agent IDs to Discord user IDs for peer bot filtering
+
+# Multi‑bot Discord setup (recommended for multi‑agent)
+# [[discord_bots]]
+# bot_token_env = "DISCORD_BOT_TOKEN_ALPHA"
+# allowed_guilds = []                     # Empty = allow all guilds
+# allowed_users = []                      # Empty = allow all users
+# default_agent = "alpha"                 # Agent ID this bot represents
+# default = true                          # Receives unaddressed messages
+# peers = { "beta" = "9876543210" }      # Knows about other bots
+
+# [[discord_bots]]
+# bot_token_env = "DISCORD_BOT_TOKEN_BETA"
+# allowed_guilds = []                     # Empty = allow all guilds
+# allowed_users = []                      # Empty = allow all users
+# default_agent = "beta"
+# default = false                         # Only responds when addressed or via reaction
+# passive_channels = ["123456789012345678"]  # Only responds to @mentions in this channel
 
 # [slack]
 # bot_token_env = "SLACK_BOT_TOKEN"
 # app_token_env = "SLACK_APP_TOKEN"
+
+# Multi‑agent Discord coordination
+# [boardroom]
+# default_turn_policy = "mention_only"    # "mention_only" or "reaction_based"
+# max_bot_streak = 3                      # Max consecutive bot messages before circuit breaker
+# context_fetch_limit = 10                # Messages to fetch when agent joins thread
+# idle_timeout_minutes = 30               # Thread idle timeout
+
+# [reaction]
+# coordination_window_ms = 400            # Time window for collecting reactions (ms)
+# classifier_model = "claude-3-haiku-20240307"  # Model for ambiguous cases
+# classifier_threshold = 0.70             # Minimum confidence for classifier
+# cleanup_reactions = true                # Remove loser reactions after decision
+
+# [topic_filter]
+# keywords = ["python", "rust"]           # Keywords indicating relevance
+# negative_keywords = ["not python"]      # Override positive matches
+# min_length = 10                         # Minimum message length to evaluate
 
 # MCP server connections
 # [[mcp_servers]]

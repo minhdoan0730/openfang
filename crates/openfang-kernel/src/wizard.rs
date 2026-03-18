@@ -182,6 +182,12 @@ impl SetupWizard {
             exec_policy: None,
             tool_allowlist: vec![],
             tool_blocklist: vec![],
+            reply_mode: openfang_types::config::ReplyMode::default(),
+            boardroom_can_invite: vec![],
+            boardroom_turn_policy: openfang_types::config::TurnPolicy::default(),
+            boardroom_domain_emoji: String::new(),
+            topic_filter: openfang_types::config::TopicFilterConfig::default(),
+            routing_roster: vec![],
         };
 
         let skills_to_install: Vec<String> = intent

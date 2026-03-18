@@ -6,6 +6,11 @@
 use crate::types::{
     split_message, ChannelAdapter, ChannelContent, ChannelMessage, ChannelType, ChannelUser,
 };
+use crate::registry::BoardroomRegistry;
+use crate::topic::TopicFilter;
+use crate::reaction::ReactionCoordinator;
+use crate::classifier::DomainClassifier;
+use crate::registry::AdapterRegistry;
 use async_trait::async_trait;
 use futures::{SinkExt, Stream, StreamExt};
 use std::collections::HashMap;
@@ -14,6 +19,7 @@ use std::sync::Arc;
 use std::time::Duration;
 use tokio::sync::{mpsc, watch, RwLock};
 use tracing::{debug, error, info, warn};
+use urlencoding;
 use zeroize::Zeroizing;
 
 const DISCORD_API_BASE: &str = "https://discord.com/api/v10";
@@ -50,15 +56,36 @@ pub struct DiscordAdapter {
     session_id: Arc<RwLock<Option<String>>>,
     /// Resume gateway URL.
     resume_gateway_url: Arc<RwLock<Option<String>>>,
+    /// Whether this adapter is the default agent for the channel.
+    default: bool,
+    /// Channel IDs where this bot is passive (only responds to direct @mentions).
+    passive_channels: Vec<String>,
+    /// Map of agent IDs to Discord user IDs for peer bot filtering.
+    peers: HashMap<String, String>,
+    /// Boardroom registry for thread management.
+    boardroom_registry: Option<Arc<BoardroomRegistry>>,
+    /// Topic filter for Tier 1 ladder classification.
+    topic_filter: Option<TopicFilter>,
+    /// Reaction coordinator for Tier 2-3 ladder coordination.
+    reaction_coordinator: Option<Arc<ReactionCoordinator>>,
+    /// Domain classifier for Tier 3 ambiguous cases.
+    classifier: Option<Arc<DomainClassifier>>,
+    /// Adapter registry for multi-bot token mapping.
+    adapter_registry: Option<Arc<AdapterRegistry>>,
 }
 
+#[allow(dead_code)]
 impl DiscordAdapter {
+    #[allow(clippy::too_many_arguments)]
     pub fn new(
         token: String,
         allowed_guilds: Vec<String>,
         allowed_users: Vec<String>,
         ignore_bots: bool,
         intents: u64,
+        default: bool,
+        passive_channels: Vec<String>,
+        peers: HashMap<String, String>,
     ) -> Self {
         let (shutdown_tx, shutdown_rx) = watch::channel(false);
         Self {
@@ -73,6 +100,14 @@ impl DiscordAdapter {
             bot_user_id: Arc::new(RwLock::new(None)),
             session_id: Arc::new(RwLock::new(None)),
             resume_gateway_url: Arc::new(RwLock::new(None)),
+            default,
+            passive_channels,
+            peers,
+            boardroom_registry: None,
+            topic_filter: None,
+            reaction_coordinator: None,
+            classifier: None,
+            adapter_registry: None,
         }
     }
 
@@ -133,6 +168,163 @@ impl DiscordAdapter {
             .await?;
         Ok(())
     }
+
+    /// Create a Discord thread in a channel.
+    async fn api_create_thread(
+        &self,
+        channel_id: &str,
+        name: &str,
+        auto_archive_duration: Option<u64>,
+        message_id: Option<&str>,
+    ) -> Result<String, Box<dyn std::error::Error>> {
+        let url = format!("{DISCORD_API_BASE}/channels/{channel_id}/threads");
+        let mut body = serde_json::json!({
+            "name": name,
+            "type": 11, // public thread
+        });
+        if let Some(duration) = auto_archive_duration {
+            body["auto_archive_duration"] = serde_json::json!(duration);
+        }
+        if let Some(msg_id) = message_id {
+            body["message_id"] = serde_json::json!(msg_id);
+        }
+
+        let resp = self
+            .client
+            .post(&url)
+            .header("Authorization", format!("Bot {}", self.token.as_str()))
+            .json(&body)
+            .send()
+            .await?;
+
+        if !resp.status().is_success() {
+            let body_text = resp.text().await.unwrap_or_default();
+            return Err(format!("Discord createThread failed: {body_text}").into());
+        }
+
+        let resp_json: serde_json::Value = resp.json().await?;
+        let thread_id = resp_json["id"]
+            .as_str()
+            .ok_or("Missing thread ID in response")?
+            .to_string();
+        Ok(thread_id)
+    }
+
+    /// Fetch message history from a Discord thread.
+    async fn api_fetch_thread_history(
+        &self,
+        thread_id: &str,
+        limit: u32,
+    ) -> Result<Vec<serde_json::Value>, Box<dyn std::error::Error>> {
+        let url = format!("{DISCORD_API_BASE}/channels/{thread_id}/messages?limit={limit}");
+        let resp = self
+            .client
+            .get(&url)
+            .header("Authorization", format!("Bot {}", self.token.as_str()))
+            .send()
+            .await?;
+
+        if !resp.status().is_success() {
+            let body_text = resp.text().await.unwrap_or_default();
+            return Err(format!("Discord fetchThreadHistory failed: {body_text}").into());
+        }
+
+        let messages: Vec<serde_json::Value> = resp.json().await?;
+        Ok(messages)
+    }
+
+    /// Join a Discord thread (bot joins thread).
+    async fn api_join_thread(&self, thread_id: &str) -> Result<(), Box<dyn std::error::Error>> {
+        let url = format!("{DISCORD_API_BASE}/channels/{thread_id}/thread-members/@me");
+        let resp = self
+            .client
+            .put(&url)
+            .header("Authorization", format!("Bot {}", self.token.as_str()))
+            .send()
+            .await?;
+
+        if !resp.status().is_success() {
+            let body_text = resp.text().await.unwrap_or_default();
+            warn!("Discord joinThread failed: {body_text}");
+        }
+        Ok(())
+    }
+
+    /// Add a reaction to a Discord message.
+    async fn api_add_reaction(
+        &self,
+        channel_id: &str,
+        message_id: &str,
+        emoji: &str,
+    ) -> Result<(), Box<dyn std::error::Error>> {
+        // URL-encode emoji if needed (custom emoji format: name:id)
+        let encoded_emoji = urlencoding::encode(emoji);
+        let url = format!(
+            "{DISCORD_API_BASE}/channels/{channel_id}/messages/{message_id}/reactions/{encoded_emoji}/@me"
+        );
+        let resp = self
+            .client
+            .put(&url)
+            .header("Authorization", format!("Bot {}", self.token.as_str()))
+            .send()
+            .await?;
+
+        if !resp.status().is_success() {
+            let body_text = resp.text().await.unwrap_or_default();
+            warn!("Discord addReaction failed: {body_text}");
+        }
+        Ok(())
+    }
+
+    /// Remove a reaction from a Discord message.
+    async fn api_remove_reaction(
+        &self,
+        channel_id: &str,
+        message_id: &str,
+        emoji: &str,
+    ) -> Result<(), Box<dyn std::error::Error>> {
+        let encoded_emoji = urlencoding::encode(emoji);
+        let url = format!(
+            "{DISCORD_API_BASE}/channels/{channel_id}/messages/{message_id}/reactions/{encoded_emoji}/@me"
+        );
+        let resp = self
+            .client
+            .delete(&url)
+            .header("Authorization", format!("Bot {}", self.token.as_str()))
+            .send()
+            .await?;
+
+        if !resp.status().is_success() {
+            let body_text = resp.text().await.unwrap_or_default();
+            warn!("Discord removeReaction failed: {body_text}");
+        }
+        Ok(())
+    }
+
+    /// Set boardroom registry.
+    pub fn set_boardroom_registry(&mut self, registry: Arc<BoardroomRegistry>) {
+        self.boardroom_registry = Some(registry);
+    }
+
+    /// Set topic filter.
+    pub fn set_topic_filter(&mut self, filter: TopicFilter) {
+        self.topic_filter = Some(filter);
+    }
+
+    /// Set reaction coordinator.
+    pub fn set_reaction_coordinator(&mut self, coordinator: Arc<ReactionCoordinator>) {
+        self.reaction_coordinator = Some(coordinator);
+    }
+
+    /// Set domain classifier.
+    pub fn set_classifier(&mut self, classifier: Arc<DomainClassifier>) {
+        self.classifier = Some(classifier);
+    }
+
+    /// Set adapter registry.
+    pub fn set_adapter_registry(&mut self, registry: Arc<AdapterRegistry>) {
+        self.adapter_registry = Some(registry);
+    }
 }
 
 #[async_trait]
@@ -159,6 +351,14 @@ impl ChannelAdapter for DiscordAdapter {
         let allowed_guilds = self.allowed_guilds.clone();
         let allowed_users = self.allowed_users.clone();
         let ignore_bots = self.ignore_bots;
+        let default = self.default;
+        let passive_channels = self.passive_channels.clone();
+        let peers = self.peers.clone();
+        let topic_filter = self.topic_filter.clone();
+        let _boardroom_registry = self.boardroom_registry.clone();
+        let _reaction_coordinator = self.reaction_coordinator.clone();
+        let _classifier = self.classifier.clone();
+        let _adapter_registry = self.adapter_registry.clone();
         let bot_user_id = self.bot_user_id.clone();
         let session_id_store = self.session_id.clone();
         let resume_url_store = self.resume_gateway_url.clone();
@@ -319,7 +519,7 @@ impl ChannelAdapter for DiscordAdapter {
 
                                 "MESSAGE_CREATE" | "MESSAGE_UPDATE" => {
                                     if let Some(msg) =
-                                        parse_discord_message(d, &bot_user_id, &allowed_guilds, &allowed_users, ignore_bots)
+                                        parse_discord_message(d, &bot_user_id, &allowed_guilds, &allowed_users, ignore_bots, default, &passive_channels, &peers, topic_filter.as_ref())
                                             .await
                                     {
                                         debug!(
@@ -431,15 +631,25 @@ impl ChannelAdapter for DiscordAdapter {
 }
 
 /// Parse a Discord MESSAGE_CREATE or MESSAGE_UPDATE payload into a `ChannelMessage`.
+#[allow(clippy::too_many_arguments)]
 async fn parse_discord_message(
     d: &serde_json::Value,
     bot_user_id: &Arc<RwLock<Option<String>>>,
     allowed_guilds: &[String],
     allowed_users: &[String],
     ignore_bots: bool,
+    default: bool,
+    passive_channels: &[String],
+    peers: &HashMap<String, String>,
+    topic_filter: Option<&TopicFilter>,
 ) -> Option<ChannelMessage> {
     let author = d.get("author")?;
     let author_id = author["id"].as_str()?;
+    let content_text = d["content"].as_str().unwrap_or("");
+    if content_text.is_empty() {
+        return None;
+    }
+    let channel_id = d["channel_id"].as_str()?;
 
     // Filter out bot's own messages
     if let Some(ref bid) = *bot_user_id.read().await {
@@ -448,8 +658,43 @@ async fn parse_discord_message(
         }
     }
 
-    // Filter out other bots (configurable via ignore_bots)
-    if ignore_bots && author["bot"].as_bool() == Some(true) {
+    // Check if bot was @mentioned (needed for peer bot filtering and passive channels)
+    let was_mentioned = if let Some(ref bid) = *bot_user_id.read().await {
+        // Check Discord mentions array
+        let mentioned_in_array = d["mentions"]
+            .as_array()
+            .map(|arr| arr.iter().any(|m| m["id"].as_str() == Some(bid.as_str())))
+            .unwrap_or(false);
+        // Also check content for <@bot_id> or <@!bot_id> patterns
+        let mentioned_in_content =
+            content_text.contains(&format!("<@{bid}>")) || content_text.contains(&format!("<@!{bid}>"));
+        mentioned_in_array || mentioned_in_content
+    } else {
+        false
+    };
+
+    // Three-tier bot filter
+    if author["bot"].as_bool() == Some(true) {
+        // Own bot already filtered above, so this is another bot
+        let is_peer_bot = peers.values().any(|discord_id| discord_id == author_id);
+        if is_peer_bot {
+            // Known peer bot: allow only if @mentioned
+            if !was_mentioned {
+                debug!("Discord: ignoring unmentioned peer bot {author_id}");
+                return None;
+            }
+        } else {
+            // Unknown bot: apply ignore_bots setting
+            if ignore_bots {
+                debug!("Discord: ignoring unknown bot {author_id}");
+                return None;
+            }
+        }
+    }
+
+    // Passive channel handling
+    if passive_channels.contains(&channel_id.to_string()) && !was_mentioned {
+        debug!("Discord: ignoring unmentioned message in passive channel {channel_id}");
         return None;
     }
 
@@ -468,12 +713,6 @@ async fn parse_discord_message(
         }
     }
 
-    let content_text = d["content"].as_str().unwrap_or("");
-    if content_text.is_empty() {
-        return None;
-    }
-
-    let channel_id = d["channel_id"].as_str()?;
     let message_id = d["id"].as_str().unwrap_or("0");
     let username = author["username"].as_str().unwrap_or("Unknown");
     let discriminator = author["discriminator"].as_str().unwrap_or("0000");
@@ -509,24 +748,19 @@ async fn parse_discord_message(
     // Determine if this is a group message (guild_id present = server channel)
     let is_group = d["guild_id"].as_str().is_some();
 
-    // Check if bot was @mentioned (for MentionOnly policy enforcement)
-    let was_mentioned = if let Some(ref bid) = *bot_user_id.read().await {
-        // Check Discord mentions array
-        let mentioned_in_array = d["mentions"]
-            .as_array()
-            .map(|arr| arr.iter().any(|m| m["id"].as_str() == Some(bid.as_str())))
-            .unwrap_or(false);
-        // Also check content for <@bot_id> or <@!bot_id> patterns
-        let mentioned_in_content =
-            content_text.contains(&format!("<@{bid}>")) || content_text.contains(&format!("<@!{bid}>"));
-        mentioned_in_array || mentioned_in_content
-    } else {
-        false
-    };
+    // Tier 1: Topic filter classification
+    let mut relevance = None;
+    if let Some(filter) = topic_filter {
+        relevance = Some(filter.evaluate(content_text));
+    }
 
     let mut metadata = HashMap::new();
     if was_mentioned {
         metadata.insert("was_mentioned".to_string(), serde_json::json!(true));
+    }
+    metadata.insert("is_default_agent".to_string(), serde_json::json!(default));
+    if let Some(rel) = relevance {
+        metadata.insert("topic_relevance".to_string(), serde_json::json!(rel.to_string()));
     }
 
     Some(ChannelMessage {
@@ -566,7 +800,7 @@ mod tests {
             "timestamp": "2024-01-01T00:00:00+00:00"
         });
 
-        let msg = parse_discord_message(&d, &bot_id, &[], &[], true).await.unwrap();
+        let msg = parse_discord_message(&d, &bot_id, &[], &[], true, false, &[], &std::collections::HashMap::new(), None).await.unwrap();
         assert_eq!(msg.channel, ChannelType::Discord);
         assert_eq!(msg.sender.display_name, "alice");
         assert_eq!(msg.sender.platform_id, "ch1");
@@ -588,7 +822,7 @@ mod tests {
             "timestamp": "2024-01-01T00:00:00+00:00"
         });
 
-        let msg = parse_discord_message(&d, &bot_id, &[], &[], true).await;
+        let msg = parse_discord_message(&d, &bot_id, &[], &[], true, false, &[], &std::collections::HashMap::new(), None).await;
         assert!(msg.is_none());
     }
 
@@ -608,7 +842,7 @@ mod tests {
             "timestamp": "2024-01-01T00:00:00+00:00"
         });
 
-        let msg = parse_discord_message(&d, &bot_id, &[], &[], true).await;
+        let msg = parse_discord_message(&d, &bot_id, &[], &[], true, false, &[], &std::collections::HashMap::new(), None).await;
         assert!(msg.is_none());
     }
 
@@ -629,7 +863,7 @@ mod tests {
         });
 
         // With ignore_bots=false, other bots' messages should be allowed
-        let msg = parse_discord_message(&d, &bot_id, &[], &[], false).await;
+        let msg = parse_discord_message(&d, &bot_id, &[], &[], false, false, &[], &std::collections::HashMap::new(), None).await;
         assert!(msg.is_some());
         let msg = msg.unwrap();
         assert_eq!(msg.sender.display_name, "somebot");
@@ -653,7 +887,7 @@ mod tests {
         });
 
         // Even with ignore_bots=false, the bot's own messages must still be filtered
-        let msg = parse_discord_message(&d, &bot_id, &[], &[], false).await;
+        let msg = parse_discord_message(&d, &bot_id, &[], &[], false, false, &[], &std::collections::HashMap::new(), None).await;
         assert!(msg.is_none());
     }
 
@@ -674,11 +908,11 @@ mod tests {
         });
 
         // Not in allowed guilds
-        let msg = parse_discord_message(&d, &bot_id, &["111".into(), "222".into()], &[], true).await;
+        let msg = parse_discord_message(&d, &bot_id, &["111".into(), "222".into()], &[], true, false, &[], &std::collections::HashMap::new(), None).await;
         assert!(msg.is_none());
 
         // In allowed guilds
-        let msg = parse_discord_message(&d, &bot_id, &["999".into()], &[], true).await;
+        let msg = parse_discord_message(&d, &bot_id, &["999".into()], &[], true, false, &[], &std::collections::HashMap::new(), None).await;
         assert!(msg.is_some());
     }
 
@@ -697,7 +931,7 @@ mod tests {
             "timestamp": "2024-01-01T00:00:00+00:00"
         });
 
-        let msg = parse_discord_message(&d, &bot_id, &[], &[], true).await.unwrap();
+        let msg = parse_discord_message(&d, &bot_id, &[], &[], true, true, &[], &std::collections::HashMap::new(), None).await.unwrap();
         match &msg.content {
             ChannelContent::Command { name, args } => {
                 assert_eq!(name, "agent");
@@ -722,7 +956,7 @@ mod tests {
             "timestamp": "2024-01-01T00:00:00+00:00"
         });
 
-        let msg = parse_discord_message(&d, &bot_id, &[], &[], true).await;
+        let msg = parse_discord_message(&d, &bot_id, &[], &[], true, true, &[], &std::collections::HashMap::new(), None).await;
         assert!(msg.is_none());
     }
 
@@ -741,7 +975,7 @@ mod tests {
             "timestamp": "2024-01-01T00:00:00+00:00"
         });
 
-        let msg = parse_discord_message(&d, &bot_id, &[], &[], true).await.unwrap();
+        let msg = parse_discord_message(&d, &bot_id, &[], &[], true, true, &[], &std::collections::HashMap::new(), None).await.unwrap();
         assert_eq!(msg.sender.display_name, "alice#1234");
     }
 
@@ -763,7 +997,7 @@ mod tests {
         });
 
         // MESSAGE_UPDATE uses the same parse function as MESSAGE_CREATE
-        let msg = parse_discord_message(&d, &bot_id, &[], &[], true).await.unwrap();
+        let msg = parse_discord_message(&d, &bot_id, &[], &[], true, true, &[], &std::collections::HashMap::new(), None).await.unwrap();
         assert_eq!(msg.channel, ChannelType::Discord);
         assert!(
             matches!(msg.content, ChannelContent::Text(ref t) if t == "Edited message content")
@@ -786,15 +1020,15 @@ mod tests {
         });
 
         // Not in allowed users
-        let msg = parse_discord_message(&d, &bot_id, &[], &["user111".into(), "user222".into()], true).await;
+        let msg = parse_discord_message(&d, &bot_id, &[], &["user111".into(), "user222".into()], true, true, &[], &std::collections::HashMap::new(), None).await;
         assert!(msg.is_none());
 
         // In allowed users
-        let msg = parse_discord_message(&d, &bot_id, &[], &["user999".into()], true).await;
+        let msg = parse_discord_message(&d, &bot_id, &[], &["user999".into()], true, true, &[], &std::collections::HashMap::new(), None).await;
         assert!(msg.is_some());
 
         // Empty allowed_users = allow all
-        let msg = parse_discord_message(&d, &bot_id, &[], &[], true).await;
+        let msg = parse_discord_message(&d, &bot_id, &[], &[], true, true, &[], &std::collections::HashMap::new(), None).await;
         assert!(msg.is_some());
     }
 
@@ -817,7 +1051,7 @@ mod tests {
             "timestamp": "2024-01-01T00:00:00+00:00"
         });
 
-        let msg = parse_discord_message(&d, &bot_id, &[], &[], true).await.unwrap();
+        let msg = parse_discord_message(&d, &bot_id, &[], &[], true, true, &[], &std::collections::HashMap::new(), None).await.unwrap();
         assert!(msg.is_group);
         assert_eq!(msg.metadata.get("was_mentioned").and_then(|v| v.as_bool()), Some(true));
 
@@ -835,7 +1069,7 @@ mod tests {
             "timestamp": "2024-01-01T00:00:00+00:00"
         });
 
-        let msg2 = parse_discord_message(&d2, &bot_id, &[], &[], true).await.unwrap();
+        let msg2 = parse_discord_message(&d2, &bot_id, &[], &[], true, true, &[], &std::collections::HashMap::new(), None).await.unwrap();
         assert!(msg2.is_group);
         assert!(!msg2.metadata.contains_key("was_mentioned"));
     }
@@ -855,13 +1089,22 @@ mod tests {
             "timestamp": "2024-01-01T00:00:00+00:00"
         });
 
-        let msg = parse_discord_message(&d, &bot_id, &[], &[], true).await.unwrap();
+        let msg = parse_discord_message(&d, &bot_id, &[], &[], true, true, &[], &std::collections::HashMap::new(), None).await.unwrap();
         assert!(!msg.is_group);
     }
 
     #[test]
     fn test_discord_adapter_creation() {
-        let adapter = DiscordAdapter::new("test-token".to_string(), vec!["123".to_string(), "456".to_string()], vec![], true, 37376);
+        let adapter = DiscordAdapter::new(
+            "test-token".to_string(),
+            vec!["123".to_string(), "456".to_string()],
+            vec![],
+            true,
+            37376,
+            false,
+            vec![],
+            std::collections::HashMap::new(),
+        );
         assert_eq!(adapter.name(), "discord");
         assert_eq!(adapter.channel_type(), ChannelType::Discord);
     }

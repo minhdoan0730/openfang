@@ -17,10 +17,15 @@ use openfang_channels::slack::SlackAdapter;
 use openfang_channels::teams::TeamsAdapter;
 use openfang_channels::telegram::TelegramAdapter;
 use openfang_channels::twitch::TwitchAdapter;
-use openfang_channels::types::ChannelAdapter;
+use openfang_channels::types::{ChannelAdapter, ChannelType};
 use openfang_channels::whatsapp::WhatsAppAdapter;
 use openfang_channels::xmpp::XmppAdapter;
 use openfang_channels::zulip::ZulipAdapter;
+// Multi-agent Discord components (reaction system temporarily disabled)
+// use openfang_channels::classifier::DomainClassifier;
+// use openfang_channels::reaction::ReactionCoordinator;
+use openfang_channels::registry::{AdapterRegistry, BoardroomRegistry};
+use openfang_channels::topic::TopicFilter;
 // Wave 3
 use openfang_channels::bluesky::BlueskyAdapter;
 use openfang_channels::feishu::FeishuAdapter;
@@ -52,6 +57,7 @@ use openfang_channels::ntfy::NtfyAdapter;
 use openfang_channels::webhook::WebhookAdapter;
 use openfang_kernel::OpenFangKernel;
 use openfang_types::agent::AgentId;
+use openfang_types::config::{BoardroomConfig, DiscordConfig, TopicFilterConfig};
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 use tracing::{error, info, warn};
@@ -1039,6 +1045,95 @@ fn read_token(env_var_or_token: &str, adapter_name: &str) -> Option<String> {
     }
 }
 
+/// Determine Discord bot token env var names to try, respecting the pattern
+/// DISCORD_BOT_TOKEN_{AGENT_NAME_UPPERCASE} when default_agent is specified.
+/// Returns a list of env var names to try in order.
+fn discord_env_vars_to_try(config: &DiscordConfig) -> Vec<String> {
+    let mut vars = Vec::new();
+
+    // Always try the configured env var first (for backward compatibility)
+    vars.push(config.bot_token_env.clone());
+
+    // If bot_token_env is the default "DISCORD_BOT_TOKEN" AND we have a default_agent,
+    // also try the pattern DISCORD_BOT_TOKEN_{AGENT_NAME_UPPERCASE}
+    if config.bot_token_env == "DISCORD_BOT_TOKEN" && config.default_agent.is_some() {
+        if let Some(agent_name) = &config.default_agent {
+            // Sanitize agent name: uppercase, replace non-alphanumeric with underscores
+            let sanitized: String = agent_name
+                .chars()
+                .map(|c| if c.is_alphanumeric() { c.to_ascii_uppercase() } else { '_' })
+                .collect();
+
+            // Remove consecutive underscores
+            let mut result = String::new();
+            let mut last_was_underscore = false;
+            for c in sanitized.chars() {
+                if c == '_' {
+                    if !last_was_underscore {
+                        result.push(c);
+                        last_was_underscore = true;
+                    }
+                } else {
+                    result.push(c);
+                    last_was_underscore = false;
+                }
+            }
+
+            // Trim leading/trailing underscores
+            let result = result.trim_matches('_');
+
+            if !result.is_empty() {
+                vars.push(format!("DISCORD_BOT_TOKEN_{}", result));
+            }
+        }
+    }
+
+    // Remove duplicates while preserving order
+    let mut seen = std::collections::HashSet::new();
+    vars.into_iter()
+        .filter(|v| seen.insert(v.clone()))
+        .collect()
+}
+
+/// Read a Discord bot token, trying multiple env var patterns.
+fn read_discord_token(config: &DiscordConfig) -> Option<String> {
+    let env_vars = discord_env_vars_to_try(config);
+
+    for env_var in &env_vars {
+        match std::env::var(env_var) {
+            Ok(t) if !t.is_empty() => {
+                // If we used a fallback pattern, log it for clarity
+                if env_var != &config.bot_token_env && env_vars.len() > 1 {
+                    info!(
+                        "Using Discord bot token from env var '{}' (pattern for agent '{}')",
+                        env_var,
+                        config.default_agent.as_deref().unwrap_or("unknown")
+                    );
+                }
+                return Some(t);
+            }
+            Ok(_) => {
+                warn!("Discord bot token env var '{}' is empty", env_var);
+            }
+            Err(_) => {
+                // Only warn for the primary env var, not fallbacks
+                if env_var == &config.bot_token_env {
+                    warn!("Discord bot token env var '{}' not set", env_var);
+                }
+            }
+        }
+    }
+
+    // None of the env vars worked
+    if env_vars.len() > 1 {
+        warn!(
+            "Discord bot token not found in any env var: {}",
+            env_vars.join(", ")
+        );
+    }
+    None
+}
+
 /// Start the channel bridge for all configured channels based on kernel config.
 ///
 /// Returns `Some(BridgeManager)` if any channels were configured and started,
@@ -1126,17 +1221,71 @@ pub async fn start_channel_bridge_with_config(
         }
     }
 
-    // Discord
-    if let Some(ref dc_config) = config.discord {
-        if let Some(token) = read_token(&dc_config.bot_token_env, "Discord") {
-            let adapter = Arc::new(DiscordAdapter::new(
-                token,
-                dc_config.allowed_guilds.clone(),
-                dc_config.allowed_users.clone(),
-                dc_config.ignore_bots,
-                dc_config.intents,
-            ));
-            adapters.push((adapter, dc_config.default_agent.clone()));
+    // Discord - multi-bot support via discord_bots, fallback to discord for backward compatibility
+    let discord_configs = if !config.discord_bots.is_empty() {
+        &config.discord_bots
+    } else if let Some(ref dc) = config.discord {
+        // Single bot legacy configuration
+        std::slice::from_ref(dc)
+    } else {
+        &[]
+    };
+
+    if !discord_configs.is_empty() {
+        // Shared adapter registry for multi-bot RelayReply mode
+        let shared_adapter_registry = Arc::new(AdapterRegistry::new());
+
+        // Shared boardroom registry (thread state independent of bot token)
+        let shared_boardroom_registry = match BoardroomRegistry::new(BoardroomConfig::default(), kernel.memory.clone()).await {
+            Ok(registry) => Some(Arc::new(registry)),
+            Err(e) => {
+                warn!("Failed to create boardroom registry, boardroom features disabled: {}", e);
+                None
+            }
+        };
+
+        for dc_config in discord_configs {
+            if let Some(token) = read_discord_token(dc_config) {
+                // Create adapter first without Arc to allow mutating it
+                let mut adapter = DiscordAdapter::new(
+                    token,
+                    dc_config.allowed_guilds.clone(),
+                    dc_config.allowed_users.clone(),
+                    dc_config.ignore_bots,
+                    dc_config.intents,
+                    dc_config.default,
+                    dc_config.passive_channels.clone(),
+                    dc_config.peers.clone(),
+                );
+
+                // Set the shared adapter registry (needed before Arc wrap)
+                adapter.set_adapter_registry(shared_adapter_registry.clone());
+
+                // Topic filter for Tier 1 relevance filtering (kept, reaction system disabled temporarily)
+                let topic_filter_config = TopicFilterConfig::default();
+                let topic_filter = TopicFilter::new(topic_filter_config);
+                adapter.set_topic_filter(topic_filter);
+
+                // Set shared boardroom registry if available
+                if let Some(ref boardroom_registry) = shared_boardroom_registry {
+                    adapter.set_boardroom_registry(boardroom_registry.clone());
+                }
+
+                // Wrap in Arc, register in shared registry (if default agent specified), then add to adapters list
+                let adapter_arc = Arc::new(adapter);
+
+                // Register this adapter in the shared registry for RelayReply mode
+                // Maps (ChannelType::Discord, agent_id) → adapter instance
+                if let Some(default_agent) = &dc_config.default_agent {
+                    shared_adapter_registry.register(
+                        ChannelType::Discord,
+                        default_agent.clone(),
+                        adapter_arc.clone(),
+                    );
+                }
+
+                adapters.push((adapter_arc, dc_config.default_agent.clone()));
+            }
         }
     }
 

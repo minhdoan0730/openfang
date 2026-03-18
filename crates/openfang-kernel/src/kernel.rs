@@ -6055,6 +6055,12 @@ mod tests {
             exec_policy: None,
             tool_allowlist: vec![],
             tool_blocklist: vec![],
+            reply_mode: openfang_types::config::ReplyMode::default(),
+            boardroom_can_invite: vec![],
+            boardroom_turn_policy: openfang_types::config::TurnPolicy::default(),
+            boardroom_domain_emoji: String::new(),
+            topic_filter: openfang_types::config::TopicFilterConfig::default(),
+            routing_roster: vec![],
         };
         manifest.capabilities.tools = vec!["file_read".to_string(), "web_fetch".to_string()];
         manifest.capabilities.agent_spawn = true;
@@ -6092,6 +6098,12 @@ mod tests {
             exec_policy: None,
             tool_allowlist: vec![],
             tool_blocklist: vec![],
+            reply_mode: openfang_types::config::ReplyMode::default(),
+            boardroom_can_invite: vec![],
+            boardroom_turn_policy: openfang_types::config::TurnPolicy::default(),
+            boardroom_domain_emoji: String::new(),
+            topic_filter: openfang_types::config::TopicFilterConfig::default(),
+            routing_roster: vec![],
         }
     }
 

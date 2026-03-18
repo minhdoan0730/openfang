@@ -67,6 +67,28 @@ pub enum OutputFormat {
     PlainText,
 }
 
+/// Turn policy for boardroom threads.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum TurnPolicy {
+    /// Agent only replies when explicitly @mentioned by the human.
+    #[default]
+    MentionOnly,
+    /// Agents signal relevance via emoji reaction before replying.
+    ReactionBased,
+}
+
+/// Specialist reply mode for delegated tasks.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum ReplyMode {
+    /// Specialist's bot posts the reply directly.
+    #[default]
+    DirectReply,
+    /// Specialist returns result to default agent for relaying.
+    RelayReply,
+}
+
 /// Per-channel behavior overrides.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(default)]
@@ -1563,7 +1585,12 @@ pub struct ChannelsConfig {
     /// Telegram bot configuration (None = disabled).
     pub telegram: Option<TelegramConfig>,
     /// Discord bot configuration (None = disabled).
+    /// Prefer `discord_bots` for multi‑bot setups.
     pub discord: Option<DiscordConfig>,
+    /// Multiple Discord bot configurations for multi‑agent setups.
+    /// If empty, falls back to `discord`.
+    #[serde(default)]
+    pub discord_bots: Vec<DiscordConfig>,
     /// Slack bot configuration (None = disabled).
     pub slack: Option<SlackConfig>,
     /// WhatsApp Cloud API configuration (None = disabled).
@@ -1707,6 +1734,15 @@ pub struct DiscordConfig {
     /// Set to false to allow bot-to-bot interactions in multi-agent setups.
     #[serde(default = "default_true")]
     pub ignore_bots: bool,
+    /// Whether this bot is the default agent for the channel (receives all unaddressed messages).
+    #[serde(default)]
+    pub default: bool,
+    /// Channel IDs where this bot is passive (only responds to direct @mentions).
+    #[serde(default, deserialize_with = "deserialize_string_or_int_vec")]
+    pub passive_channels: Vec<String>,
+    /// Map of agent IDs to Discord user IDs for peer bot filtering.
+    #[serde(default)]
+    pub peers: HashMap<String, String>,
     /// Default channel ID for outgoing messages when no recipient is specified.
     #[serde(default)]
     pub default_channel_id: Option<String>,
@@ -1724,6 +1760,9 @@ impl Default for DiscordConfig {
             default_agent: None,
             intents: 37376,
             ignore_bots: true,
+            default: false,
+            passive_channels: vec![],
+            peers: HashMap::new(),
             default_channel_id: None,
             overrides: ChannelOverrides::default(),
         }
@@ -2909,6 +2948,111 @@ impl Default for LinkedInConfig {
             overrides: ChannelOverrides::default(),
         }
     }
+}
+
+/// Boardroom configuration for multi‑agent Discord collaboration.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(default)]
+pub struct BoardroomConfig {
+    /// Default turn policy for new boardroom threads.
+    #[serde(default)]
+    pub default_turn_policy: TurnPolicy,
+    /// Maximum consecutive bot messages before circuit breaker silences all agents.
+    #[serde(default = "default_max_bot_streak")]
+    pub max_bot_streak: u32,
+    /// Number of messages to fetch as context when an agent joins a thread.
+    #[serde(default = "default_context_fetch_limit")]
+    pub context_fetch_limit: usize,
+    /// Minutes of inactivity after which a thread is considered idle and may be cleaned up.
+    #[serde(default = "default_idle_timeout_minutes")]
+    pub idle_timeout_minutes: u32,
+}
+
+fn default_max_bot_streak() -> u32 { 3 }
+fn default_context_fetch_limit() -> usize { 10 }
+fn default_idle_timeout_minutes() -> u32 { 30 }
+
+impl Default for BoardroomConfig {
+    fn default() -> Self {
+        Self {
+            default_turn_policy: TurnPolicy::MentionOnly,
+            max_bot_streak: default_max_bot_streak(),
+            context_fetch_limit: default_context_fetch_limit(),
+            idle_timeout_minutes: default_idle_timeout_minutes(),
+        }
+    }
+}
+
+/// Reaction coordination configuration for the 4‑tier processing ladder.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(default)]
+pub struct ReactionConfig {
+    /// Time window in milliseconds for collecting reactions before deciding a winner.
+    #[serde(default = "default_coordination_window_ms")]
+    pub coordination_window_ms: u64,
+    /// Model to use for domain classification in ambiguous cases (Tier 3).
+    #[serde(default = "default_classifier_model")]
+    pub classifier_model: String,
+    /// Minimum confidence threshold (0.0–1.0) for classifier decisions.
+    #[serde(default = "default_classifier_threshold")]
+    pub classifier_threshold: f32,
+    /// Whether to remove loser reactions after a decision is made.
+    #[serde(default = "default_cleanup_reactions")]
+    pub cleanup_reactions: bool,
+}
+
+fn default_coordination_window_ms() -> u64 { 400 }
+fn default_classifier_model() -> String { "claude-3-haiku-20240307".to_string() }
+fn default_classifier_threshold() -> f32 { 0.70 }
+fn default_cleanup_reactions() -> bool { true }
+
+impl Default for ReactionConfig {
+    fn default() -> Self {
+        Self {
+            coordination_window_ms: default_coordination_window_ms(),
+            classifier_model: default_classifier_model(),
+            classifier_threshold: default_classifier_threshold(),
+            cleanup_reactions: default_cleanup_reactions(),
+        }
+    }
+}
+
+/// Topic filter configuration for Tier 1 of the processing ladder.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(default)]
+pub struct TopicFilterConfig {
+    /// Keywords that indicate a message is relevant to this agent’s domain.
+    #[serde(default)]
+    pub keywords: Vec<String>,
+    /// Keywords that override positive matches (e.g., “not X”).
+    #[serde(default)]
+    pub negative_keywords: Vec<String>,
+    /// Minimum message length (characters) to evaluate; shorter messages are “unknown”.
+    #[serde(default = "default_topic_min_length")]
+    pub min_length: usize,
+}
+
+fn default_topic_min_length() -> usize { 10 }
+
+impl Default for TopicFilterConfig {
+    fn default() -> Self {
+        Self {
+            keywords: Vec::new(),
+            negative_keywords: Vec::new(),
+            min_length: default_topic_min_length(),
+        }
+    }
+}
+
+/// Entry in an agent’s routing roster, describing a specialist agent.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct RoutingRosterEntry {
+    /// Agent ID of the specialist.
+    pub agent_id: String,
+    /// Human‑readable role description (e.g., “frontend developer”).
+    pub role: String,
+    /// Domain keywords or descriptions (used for routing decisions).
+    pub domains: Vec<String>,
 }
 
 impl KernelConfig {
