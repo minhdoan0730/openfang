@@ -10,6 +10,7 @@ pub mod copilot;
 pub mod fallback;
 pub mod gemini;
 pub mod openai;
+pub mod qwen_code;
 
 use crate::llm_driver::{DriverConfig, LlmDriver, LlmError};
 use openfang_types::model_catalog::{
@@ -303,7 +304,19 @@ pub fn create_driver(config: &DriverConfig) -> Result<Arc<dyn LlmDriver>, LlmErr
     // Claude Code CLI — subprocess-based, no API key needed
     if provider == "claude-code" {
         let cli_path = config.base_url.clone();
-        return Ok(Arc::new(claude_code::ClaudeCodeDriver::new(cli_path)));
+        return Ok(Arc::new(claude_code::ClaudeCodeDriver::new(
+            cli_path,
+            config.skip_permissions,
+        )));
+    }
+
+    // Qwen Code CLI — subprocess-based, uses Qwen OAuth (free tier)
+    if provider == "qwen-code" {
+        let cli_path = config.base_url.clone();
+        return Ok(Arc::new(qwen_code::QwenCodeDriver::new(
+            cli_path,
+            config.skip_permissions,
+        )));
     }
 
     // GitHub Copilot — wraps OpenAI-compatible driver with automatic token exchange.
@@ -483,6 +496,7 @@ pub fn known_providers() -> &'static [&'static str] {
         "venice",
         "codex",
         "claude-code",
+        "qwen-code",
     ]
 }
 
@@ -522,6 +536,7 @@ mod tests {
             provider: "my-custom-llm".to_string(),
             api_key: Some("test".to_string()),
             base_url: Some("http://localhost:9999/v1".to_string()),
+            skip_permissions: true,
         };
         let driver = create_driver(&config);
         assert!(driver.is_ok());
@@ -533,6 +548,7 @@ mod tests {
             provider: "nonexistent".to_string(),
             api_key: None,
             base_url: None,
+            skip_permissions: true,
         };
         let driver = create_driver(&config);
         assert!(driver.is_err());
@@ -582,7 +598,8 @@ mod tests {
         assert!(providers.contains(&"chutes"));
         assert!(providers.contains(&"codex"));
         assert!(providers.contains(&"claude-code"));
-        assert_eq!(providers.len(), 34);
+        assert!(providers.contains(&"qwen-code"));
+        assert_eq!(providers.len(), 35);
     }
 
     #[test]
@@ -633,6 +650,7 @@ mod tests {
             provider: "nvidia".to_string(),
             api_key: None, // not explicitly passed
             base_url: Some("https://integrate.api.nvidia.com/v1".to_string()),
+            skip_permissions: true,
         };
         let driver = create_driver(&config);
         assert!(driver.is_ok(), "Custom provider with env var convention should succeed");
@@ -646,6 +664,7 @@ mod tests {
             provider: "nvidia".to_string(),
             api_key: None,
             base_url: None,
+            skip_permissions: true,
         };
         let driver = create_driver(&config);
         assert!(driver.is_err());
@@ -660,6 +679,7 @@ mod tests {
             provider: "nvidia".to_string(),
             api_key: None,
             base_url: None,
+            skip_permissions: true,
         };
         let result = create_driver(&config);
         assert!(result.is_err());
@@ -683,6 +703,7 @@ mod tests {
             provider: "my-custom-provider".to_string(),
             api_key: Some("explicit-key".to_string()),
             base_url: Some("https://api.example.com/v1".to_string()),
+            skip_permissions: true,
         };
         let driver = create_driver(&config);
         assert!(driver.is_ok());

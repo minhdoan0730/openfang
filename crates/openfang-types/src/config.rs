@@ -90,7 +90,7 @@ pub enum ReplyMode {
 }
 
 /// Per-channel behavior overrides.
-#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+#[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(default)]
 pub struct ChannelOverrides {
     /// Model override (uses agent's default if None).
@@ -111,6 +111,27 @@ pub struct ChannelOverrides {
     pub usage_footer: Option<UsageFooterMode>,
     /// Typing indicator mode override.
     pub typing_mode: Option<TypingMode>,
+    /// Whether to send lifecycle emoji reactions (⏳🤔✅❌) on messages.
+    /// Defaults to true. Set to false to suppress automatic reactions (e.g. on Telegram).
+    #[serde(default = "default_true")]
+    pub lifecycle_reactions: bool,
+}
+
+impl Default for ChannelOverrides {
+    fn default() -> Self {
+        Self {
+            model: None,
+            system_prompt: None,
+            dm_policy: DmPolicy::default(),
+            group_policy: GroupPolicy::default(),
+            rate_limit_per_user: 0,
+            threading: false,
+            output_format: None,
+            usage_footer: None,
+            typing_mode: None,
+            lifecycle_reactions: true,
+        }
+    }
 }
 
 /// Controls what usage info appears in response footers.
@@ -1093,6 +1114,39 @@ pub struct KernelConfig {
     /// OAuth client ID overrides for PKCE flows.
     #[serde(default)]
     pub oauth: OAuthConfig,
+    /// Dashboard authentication (username/password login).
+    #[serde(default)]
+    pub auth: AuthConfig,
+    /// Directory for auto-loading workflow JSON files on startup.
+    /// Defaults to `~/.openfang/workflows`. Set to empty string to disable.
+    #[serde(default)]
+    pub workflows_dir: Option<PathBuf>,
+}
+
+/// Dashboard authentication (username/password login).
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(default)]
+pub struct AuthConfig {
+    /// Enable username/password authentication for the dashboard.
+    pub enabled: bool,
+    /// Admin username.
+    pub username: String,
+    /// SHA256 hash of the password (hex-encoded).
+    /// Generate with: openfang auth hash-password
+    pub password_hash: String,
+    /// Session token lifetime in hours (default: 168 = 7 days).
+    pub session_ttl_hours: u64,
+}
+
+impl Default for AuthConfig {
+    fn default() -> Self {
+        Self {
+            enabled: false,
+            username: "admin".to_string(),
+            password_hash: String::new(),
+            session_ttl_hours: 168,
+        }
+    }
 }
 
 /// OAuth client ID overrides for PKCE flows.
@@ -1223,6 +1277,10 @@ fn default_true() -> bool {
     true
 }
 
+fn default_thread_ttl() -> u64 {
+    24
+}
+
 impl Default for KernelConfig {
     fn default() -> Self {
         let home_dir = openfang_home_dir();
@@ -1270,6 +1328,8 @@ impl Default for KernelConfig {
             provider_urls: HashMap::new(),
             provider_api_keys: HashMap::new(),
             oauth: OAuthConfig::default(),
+            auth: AuthConfig::default(),
+            workflows_dir: None,
         }
     }
 }
@@ -1387,6 +1447,7 @@ impl std::fmt::Debug for KernelConfig {
                 "provider_api_keys",
                 &format!("{} mapping(s)", self.provider_api_keys.len()),
             )
+            .field("auth", &format!("enabled={}", self.auth.enabled))
             .finish()
     }
 }
@@ -1629,6 +1690,10 @@ pub struct TelegramConfig {
     /// Defaults to `https://api.telegram.org` when not set.
     #[serde(default)]
     pub api_url: Option<String>,
+    /// Default chat ID for outgoing messages when no recipient is specified.
+    /// Allows channel_send(channel="telegram", message="...") without a recipient.
+    #[serde(default)]
+    pub default_chat_id: Option<String>,
     /// Per-channel behavior overrides.
     #[serde(default)]
     pub overrides: ChannelOverrides,
@@ -1642,6 +1707,7 @@ impl Default for TelegramConfig {
             default_agent: None,
             poll_interval_secs: 1,
             api_url: None,
+            default_chat_id: None,
             overrides: ChannelOverrides::default(),
         }
     }
@@ -1677,6 +1743,9 @@ pub struct DiscordConfig {
     /// Map of agent IDs to Discord user IDs for peer bot filtering.
     #[serde(default)]
     pub peers: HashMap<String, String>,
+    /// Default channel ID for outgoing messages when no recipient is specified.
+    #[serde(default)]
+    pub default_channel_id: Option<String>,
     /// Per-channel behavior overrides.
     #[serde(default)]
     pub overrides: ChannelOverrides,
@@ -1694,6 +1763,7 @@ impl Default for DiscordConfig {
             default: false,
             passive_channels: vec![],
             peers: HashMap::new(),
+            default_channel_id: None,
             overrides: ChannelOverrides::default(),
         }
     }
@@ -1715,6 +1785,12 @@ pub struct SlackConfig {
     /// Per-channel behavior overrides.
     #[serde(default)]
     pub overrides: ChannelOverrides,
+    /// Automatically reply to follow-up messages in threads where bot was mentioned.
+    #[serde(default = "default_true")]
+    pub auto_thread_reply: bool,
+    /// Hours to track a thread after last interaction (default: 24).
+    #[serde(default = "default_thread_ttl")]
+    pub thread_ttl_hours: u64,
 }
 
 impl Default for SlackConfig {
@@ -1725,6 +1801,8 @@ impl Default for SlackConfig {
             allowed_channels: vec![],
             default_agent: None,
             overrides: ChannelOverrides::default(),
+            auto_thread_reply: true,
+            thread_ttl_hours: 24,
         }
     }
 }
@@ -3739,6 +3817,7 @@ mod tests {
         assert!(!ov.threading);
         assert!(ov.output_format.is_none());
         assert!(ov.model.is_none());
+        assert!(ov.lifecycle_reactions);
     }
 
     #[test]
@@ -3798,6 +3877,25 @@ mod tests {
         assert_eq!(back.rate_limit_per_user, 10);
         assert!(back.threading);
         assert_eq!(back.output_format, Some(OutputFormat::TelegramHtml));
+        // lifecycle_reactions defaults to true via ..Default::default()
+        assert!(back.lifecycle_reactions);
+    }
+
+    #[test]
+    fn test_channel_overrides_lifecycle_reactions_disabled() {
+        let json = r#"{"lifecycle_reactions": false}"#;
+        let ov: ChannelOverrides = serde_json::from_str(json).unwrap();
+        assert!(!ov.lifecycle_reactions);
+        // Other fields should have their defaults
+        assert_eq!(ov.dm_policy, DmPolicy::Respond);
+        assert!(ov.model.is_none());
+    }
+
+    #[test]
+    fn test_channel_overrides_lifecycle_reactions_missing_defaults_true() {
+        let json = r#"{}"#;
+        let ov: ChannelOverrides = serde_json::from_str(json).unwrap();
+        assert!(ov.lifecycle_reactions);
     }
 
     #[test]
